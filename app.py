@@ -1,37 +1,10 @@
-"""
-AI / NLP PORTFOLIO  -  Streamlit
-
-Projects:
-  1. Food Review System              (text  -> sentiment)
-  2. Movie Recommendation System     (movie -> similar movies + posters)
-  3. Speech Mental Health Detection  (audio -> Normal / Anxious / Depressed)
-  4. Fake News Detection             (text  -> Real / Fake)
-  5. Face Gender Detection           (photo -> detect faces -> Female / Male)
-
-Naya project add karna ho to file ke neeche PROJECTS dict me entry add karein.
-
-Folder structure:
-    Project/
-    ├── app.py
-    ├── requirements.txt
-    └── models/
-        ├── food_review/
-        │   └── final_rev_data.pkl
-        ├── movie_recommender/
-        │   ├── model.pkl
-        │   ├── vectors.pkl
-        │   └── dataframe.pkl
-        ├── speech_mental_health/
-        │   ├── best_model.pkl
-        │   └── label_encoder.pkl      (optional, na ho to app khud bana lega)
-        ├── news_classifier/
-        │   └── Fakenews.pkl
-        └── face_gender_model.pkl      (ya face_gender/model.pkl)
-"""
-
 import html
 import io
+import os
 import re
+import shutil
+import threading
+import time
 import zlib
 from pathlib import Path
 
@@ -39,7 +12,19 @@ import joblib
 import numpy as np
 import requests
 import streamlit as st
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
+
+# Auto-capture (live camera) ke liye:  pip install streamlit-webrtc av
+try:
+    import av
+    from streamlit_webrtc import VideoProcessorBase, WebRtcMode, webrtc_streamer
+    WEBRTC_OK = True
+except Exception:   # package install nahi hai -> baaki app chalta rahe
+    av = None
+    VideoProcessorBase = object
+    WEBRTC_OK = False
 
 # =====================================================================
 # 1. SETTINGS  (yahan apni details badlein)
@@ -83,13 +68,16 @@ HEADERS = {
         "Chrome/124.0.0.0 Safari/537.36"
     )
 }
-st.sidebar.image(
-    "https://images.nightcafe.studio/galleries/GyzsoaOdxRKFcwbJD0sj/an_abstract_representation_of_artificial--1--gr9zw.jpg"
-)
 
+# NOTE: st.set_page_config() hamesha pehla Streamlit command hona chahiye,
+# isliye sidebar image ko iske baad rakha gaya hai.
 st.set_page_config(
     page_title=f"{PROFILE['name']} | AI Portfolio",
     layout="wide",
+)
+
+st.sidebar.image(
+    "https://images.nightcafe.studio/galleries/GyzsoaOdxRKFcwbJD0sj/an_abstract_representation_of_artificial--1--gr9zw.jpg"
 )
 
 # =====================================================================
@@ -144,14 +132,34 @@ def theme(c1: str, c2: str):
     st.markdown(f"<style>:root{{--c1:{c1};--c2:{c2};}}</style>", unsafe_allow_html=True)
 
 
+def neural_svg() -> str:
+    """Chhota animated neural-network drawing (hero ke liye)."""
+    layers, xs, h = [4, 6, 6, 3], [30, 120, 210, 300], 220
+    pts = [[(xs[li], h / (n + 1) * (j + 1)) for j in range(n)] for li, n in enumerate(layers)]
+    lines_svg = "".join(
+        f'<line x1="{x1}" y1="{y1:.0f}" x2="{x2}" y2="{y2:.0f}"/>'
+        for a, b in zip(pts, pts[1:]) for (x1, y1) in a for (x2, y2) in b
+    )
+    dots, k = "", 0
+    for layer in pts:
+        for (x, y) in layer:
+            dots += f'<circle cx="{x}" cy="{y:.0f}" r="5" style="animation-delay:{(k % 7) * 0.35:.2f}s"/>'
+            k += 1
+    return (f'<svg class="neural" viewBox="0 0 330 {h}" xmlns="http://www.w3.org/2000/svg">'
+            f'<g class="n-lines">{lines_svg}</g><g class="n-dots">{dots}</g></svg>')
+
+
 def page_hero(p: dict):
     st.markdown(
         H(f"""
         <div class="page-hero">
+            <div class="scan"></div>
             <div class="page-icon">{p['icon']}</div>
-            <div>
+            <div class="page-hero-text">
+                <div class="crumb">~/projects/{html.escape(p['key'])} <span class="cursor">▍</span></div>
                 <h1>{html.escape(p['title'])}</h1>
                 <p>{html.escape(p['tagline'])}</p>
+                <div class="page-tags">{chips(p['tags'])}</div>
             </div>
         </div>
         """),
@@ -160,13 +168,16 @@ def page_hero(p: dict):
 
 
 def how_panel(p: dict):
-    steps = "".join(f"<li>{html.escape(s)}</li>" for s in p["how"])
+    steps = "".join(
+        f'<div class="pipe-step"><div class="pipe-num">{i:02d}</div>'
+        f'<div class="pipe-text">{html.escape(s)}</div></div>'
+        for i, s in enumerate(p["how"], start=1)
+    )
     st.markdown(
         H(f"""
         <div class="panel">
-            <h4>⚙️ How it works</h4>
-            <ol>{steps}</ol>
-            <div style="margin-top:8px">{chips(p['tags'])}</div>
+            <div class="panel-title"><span class="dot"></span>PIPELINE · HOW IT WORKS</div>
+            <div class="pipe">{steps}</div>
         </div>
         """),
         unsafe_allow_html=True,
@@ -179,6 +190,7 @@ def result_card(emoji: str, color: str, title: str, sub: str):
         <div class="result-card" style="--rc:{color}">
             <div class="result-emoji">{emoji}</div>
             <div>
+                <div class="result-kicker">▸ MODEL OUTPUT</div>
                 <div class="result-label">{html.escape(title)}</div>
                 <div class="result-sub">{html.escape(sub)}</div>
             </div>
@@ -201,14 +213,18 @@ def prob_bars(scores):
         """)
         for n, s in scores[:6]
     )
-    st.markdown(f"<div class='panel'><h4>📊 Probability breakdown</h4>{bars}</div>",
-                unsafe_allow_html=True)
+    st.markdown(
+        f"<div class='panel'><div class='panel-title'><span class='dot'></span>"
+        f"PROBABILITY DISTRIBUTION</div>{bars}</div>",
+        unsafe_allow_html=True,
+    )
 
 
 def footer():
     st.markdown(
-        f"<div class='footer'>Built with ❤️ by {html.escape(PROFILE['name'])} · "
-        "Python · Scikit-learn · Streamlit</div>",
+        f"<div class='footer'><span class='prompt'>&gt;</span> built by "
+        f"{html.escape(PROFILE['name'])} · python · scikit-learn · streamlit"
+        "<span class='cursor'>▍</span></div>",
         unsafe_allow_html=True,
     )
 
@@ -220,131 +236,312 @@ def footer():
 st.markdown(
     """
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;500;600;700;800&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&family=Space+Grotesk:wght@500;600;700&display=swap');
 
-:root { --c1:#7f5af0; --c2:#2cb67d; }
+:root {
+    --c1:#8b5cf6; --c2:#22d3ee;
+    --bg:#06070d; --panel:rgba(255,255,255,.035); --line:rgba(255,255,255,.09);
+    --text:#eceefb; --muted:#9aa0bd;
+    --mono:'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+    --head:'Space Grotesk', 'Inter', sans-serif;
+}
 
 .stApp, .stApp p, .stApp label, .stApp button, .stApp textarea,
-.stApp input, .stApp h1, .stApp h2, .stApp h3, .stApp h4, .stApp li {
-    font-family: 'Poppins', sans-serif;
-}
-.stApp { background: #0b0b12; color: #f2f2f7; }
+.stApp input, .stApp li { font-family: 'Inter', sans-serif; }
+.stApp h1, .stApp h2, .stApp h3, .stApp h4 { font-family: var(--head); }
+.stApp { background: var(--bg); color: var(--text); }
+::selection { background: color-mix(in srgb, var(--c1) 55%, transparent); color:#fff; }
 #MainMenu, footer { visibility: hidden; }
-.block-container { padding-top: 2rem; max-width: 1200px; }
+header[data-testid="stHeader"] { background: transparent; }
+.block-container { position: relative; z-index: 1; padding-top: 2rem; max-width: 1200px; }
+hr { border-color: var(--line) !important; }
+
+/* ---------- AI background: glow orbs + faint grid ---------- */
+.stApp::before {
+    content:""; position:fixed; inset:0; z-index:0; pointer-events:none;
+    background:
+        radial-gradient(700px 480px at 8% -5%, color-mix(in srgb, var(--c1) 28%, transparent), transparent 65%),
+        radial-gradient(620px 460px at 98% 105%, color-mix(in srgb, var(--c2) 22%, transparent), transparent 65%);
+}
+.stApp::after {
+    content:""; position:fixed; inset:0; z-index:0; pointer-events:none;
+    background-image:
+        linear-gradient(rgba(255,255,255,.035) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(255,255,255,.035) 1px, transparent 1px);
+    background-size: 44px 44px;
+    -webkit-mask-image: radial-gradient(ellipse at 50% 25%, #000 15%, transparent 75%);
+    mask-image: radial-gradient(ellipse at 50% 25%, #000 15%, transparent 75%);
+}
+
+.mono { font-family: var(--mono); }
+.cursor { color: var(--c2); animation: blink 1s step-end infinite; }
+@keyframes blink { 50% { opacity: 0; } }
+@keyframes pulse { 0%,100% { opacity:.35; transform: scale(.9); } 50% { opacity:1; transform: scale(1.25); } }
+@keyframes dash { to { stroke-dashoffset: -40; } }
+@keyframes grow { from { transform: scaleX(0); } to { transform: scaleX(1); } }
+@keyframes scan { 0% { transform: translateX(-120%); } 100% { transform: translateX(520%); } }
+@keyframes typing { to { width: 100%; } }
+@keyframes caret { 50% { border-color: transparent; } }
+@keyframes spin { to { transform: rotate(360deg); } }
 
 /* ---------- Sidebar ---------- */
-[data-testid="stSidebar"] { background: #10101a; border-right: 1px solid #1f1f2e; }
+[data-testid="stSidebar"] {
+    background: linear-gradient(180deg, #0b0d18, #080a12);
+    border-right: 1px solid var(--line);
+}
 [data-testid="stSidebar"] * { color: #ffffff; }
-.side-logo { text-align:center; padding: 8px 0 4px 0; }
-.side-logo .emoji { font-size: 46px; }
-.side-logo .name { font-size: 20px; font-weight: 700; }
-.side-logo .role { font-size: 12px; color: #9a9ab0 !important; }
-.side-status { font-size: 13px; padding: 3px 0; color:#c9c9d8; }
+.side-logo { text-align:center; padding: 10px 0 6px 0; }
+.avatar {
+    width: 74px; height: 74px; margin: 0 auto 10px auto; border-radius: 50%; padding: 3px;
+    background: conic-gradient(from 0deg, var(--c1), var(--c2), var(--c1));
+    animation: spin 6s linear infinite;
+}
+.avatar span {
+    width:100%; height:100%; border-radius:50%; background:#0b0d18;
+    display:flex; align-items:center; justify-content:center;
+    font: 700 24px var(--head); animation: spin 6s linear infinite reverse;
+}
+.side-logo .name { font: 700 19px var(--head); }
+.side-logo .role { font: 500 12px var(--mono); color: var(--c2) !important; margin-top: 2px; }
+.side-label {
+    font: 600 10.5px var(--mono); letter-spacing: .18em; color: var(--muted) !important;
+    margin: 14px 0 6px 2px;
+}
+[data-testid="stSidebar"] [role="radiogroup"] { gap: 4px; }
+[data-testid="stSidebar"] [role="radiogroup"] label {
+    padding: 8px 12px; border-radius: 12px; border: 1px solid transparent; transition: .2s; width:100%;
+}
+[data-testid="stSidebar"] [role="radiogroup"] label:hover { background: var(--panel); border-color: var(--line); }
+[data-testid="stSidebar"] [role="radiogroup"] label:has(input:checked) {
+    background: linear-gradient(90deg, color-mix(in srgb, var(--c1) 30%, transparent), transparent);
+    border-color: color-mix(in srgb, var(--c1) 55%, transparent);
+}
+.side-status {
+    display:flex; align-items:center; gap:9px; font-size: 12.5px; padding: 5px 2px; color:#c9cde4;
+}
+.side-state { margin-left:auto; font: 500 9.5px var(--mono); letter-spacing:.08em; color: var(--muted); }
+.led { width:8px; height:8px; border-radius:50%; flex:none; }
+.led.on  { background:#34d399; box-shadow:0 0 0 0 rgba(52,211,153,.7); animation: ledpulse 2s infinite; }
+.led.off { background:#f87171; box-shadow:0 0 8px rgba(248,113,113,.6); }
+@keyframes ledpulse { 70% { box-shadow: 0 0 0 7px rgba(52,211,153,0); } 100% { box-shadow: 0 0 0 0 rgba(52,211,153,0); } }
 
-/* ---------- Home hero ---------- */
+/* ---------- Home hero (terminal window) ---------- */
 .hero {
-    padding: 50px 40px; border-radius: 24px; margin-bottom: 28px;
-    background:
-        radial-gradient(circle at 15% 20%, rgba(127,90,240,0.45), transparent 45%),
-        radial-gradient(circle at 85% 80%, rgba(44,182,125,0.35), transparent 45%),
-        #14141f;
-    border: 1px solid #25253a;
+    position: relative; overflow: hidden; border-radius: 22px; margin-bottom: 20px;
+    border: 1px solid var(--line);
+    background: linear-gradient(145deg, rgba(255,255,255,.055), rgba(255,255,255,.015));
+    box-shadow: 0 24px 70px rgba(0,0,0,.5), inset 0 1px 0 rgba(255,255,255,.07);
 }
-.hero-hi { font-size: 18px; color: #b9b9d0; }
+.term-bar {
+    display:flex; align-items:center; gap:7px; padding: 11px 18px;
+    background: rgba(0,0,0,.28); border-bottom: 1px solid var(--line);
+    font: 500 12px var(--mono); color: var(--muted);
+}
+.term-bar i { width:11px; height:11px; border-radius:50%; display:inline-block; }
+.term-bar i:nth-child(1){ background:#ff5f57; } .term-bar i:nth-child(2){ background:#febc2e; }
+.term-bar i:nth-child(3){ background:#28c840; }
+.term-bar b { margin-left: 10px; font-weight: 500; }
+.hero-body { display:flex; flex-wrap:wrap; align-items:center; gap: 24px; padding: 34px 40px; }
+.hero-left { flex: 1 1 440px; min-width: 0; }
+.hero-right { flex: 0 1 330px; }
+.hero-cmd { font: 500 14px var(--mono); color: var(--c2); margin-bottom: 14px; }
+.typing {
+    display:inline-block; overflow:hidden; white-space:nowrap; vertical-align:bottom; width:0;
+    border-right: 2px solid var(--c2);
+    animation: typing 2.6s steps(30) .3s forwards, caret .8s step-end infinite;
+}
+.hero-hi { font: 500 15px var(--mono); color: var(--muted); }
 .hero h1 {
-    font-size: 58px; font-weight: 800; margin: 0; line-height: 1.1;
-    background: linear-gradient(90deg, #ffffff, #b69cff, #5eeaa8);
-    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+    font: 700 58px/1.05 var(--head); margin: 4px 0 0 0; letter-spacing: -.02em;
+    background: linear-gradient(90deg, #ffffff 0%, color-mix(in srgb, var(--c1) 70%, #fff) 45%, var(--c2) 100%);
+    -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent;
 }
-.hero-role { font-size: 22px; font-weight: 600; color: #5eeaa8; margin: 6px 0 14px 0; }
-.hero p { font-size: 16px; color: #d3d3e3; max-width: 720px; line-height: 1.7; }
+.hero-role { font: 600 18px var(--mono); color: var(--c2); margin: 10px 0 14px 0; }
+.hero p { font-size: 15.5px; color: #cfd2e8; max-width: 640px; line-height: 1.75; }
+
+.neural { width:100%; height:auto; filter: drop-shadow(0 0 18px color-mix(in srgb, var(--c1) 45%, transparent)); }
+.neural .n-lines line { stroke: rgba(170,180,255,.16); stroke-width: 1; }
+.neural .n-lines line:nth-child(7n) {
+    stroke: var(--c2); opacity:.6; stroke-dasharray: 4 6; animation: dash 3s linear infinite;
+}
+.neural .n-dots circle { fill: var(--c1); transform-box: fill-box; transform-origin: center; animation: pulse 2.4s ease-in-out infinite; }
+.neural .n-dots circle:nth-child(3n) { fill: var(--c2); }
 
 .chip {
-    display: inline-block; padding: 5px 13px; margin: 4px 6px 0 0;
-    border-radius: 999px; font-size: 12.5px; font-weight: 500;
-    background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.14);
-    color: #f2f2f7;
+    display:inline-block; padding: 4px 12px; margin: 4px 6px 0 0; border-radius: 8px;
+    font: 500 11.5px var(--mono); letter-spacing: .01em; color: #dfe2f7;
+    background: rgba(255,255,255,.055); border: 1px solid var(--line);
 }
 
-.section-title { font-size: 26px; font-weight: 700; margin: 26px 0 4px 0; }
-.section-sub { color: #9a9ab0; margin-bottom: 14px; }
+/* ---------- Stat strip ---------- */
+.stat-row { display:grid; grid-template-columns: repeat(4, 1fr); gap: 14px; margin-bottom: 8px; }
+.stat {
+    padding: 16px 20px; border-radius: 16px; background: var(--panel); border: 1px solid var(--line);
+}
+.stat .v {
+    font: 700 30px var(--mono);
+    background: linear-gradient(90deg, var(--c1), var(--c2));
+    -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent;
+}
+.stat .l { font: 500 11px var(--mono); letter-spacing: .14em; color: var(--muted); text-transform: uppercase; }
+@media (max-width: 800px) { .stat-row { grid-template-columns: repeat(2, 1fr); } .hero h1 { font-size: 40px; } }
+
+.section-title {
+    display:flex; align-items:center; gap:10px; font: 700 25px var(--head); margin: 30px 0 4px 0;
+}
+.section-title .mono { color: var(--c2); font-size: 20px; }
+.section-title::after { content:""; flex:1; height:1px; background: linear-gradient(90deg, var(--line), transparent); }
+.section-sub { color: var(--muted); font-size: 14px; margin-bottom: 16px; }
 
 /* ---------- Project cards (home) ---------- */
 .proj-card {
-    position: relative; overflow: hidden;
-    background: #14141f; border: 1px solid #25253a; border-radius: 20px;
-    padding: 22px; min-height: 300px; transition: .3s;
+    position: relative; overflow: hidden; min-height: 330px; padding: 22px;
+    background: linear-gradient(160deg, rgba(255,255,255,.05), rgba(255,255,255,.015));
+    border: 1px solid var(--line); border-radius: 20px; transition: .3s; backdrop-filter: blur(6px);
 }
 .proj-card::before {
-    content:""; position:absolute; top:0; left:0; right:0; height:5px;
+    content:""; position:absolute; top:0; left:0; right:0; height:3px;
     background: linear-gradient(90deg, var(--c1), var(--c2));
 }
-.proj-card:hover { transform: translateY(-5px); border-color: var(--c1); box-shadow: 0 14px 34px rgba(0,0,0,.5); }
-.proj-top { display:flex; justify-content:space-between; align-items:center; }
+.proj-card::after {
+    content:""; position:absolute; width:220px; height:220px; right:-90px; top:-90px; border-radius:50%;
+    background: radial-gradient(circle, color-mix(in srgb, var(--c1) 35%, transparent), transparent 70%);
+    opacity:.5; transition:.3s;
+}
+.proj-card:hover {
+    transform: translateY(-6px); border-color: color-mix(in srgb, var(--c1) 70%, transparent);
+    box-shadow: 0 18px 44px rgba(0,0,0,.55), 0 0 32px color-mix(in srgb, var(--c1) 28%, transparent);
+}
+.proj-card:hover::after { opacity: 1; }
+.proj-top { position:relative; z-index:1; display:flex; justify-content:space-between; align-items:center; }
 .proj-icon {
-    width: 56px; height: 56px; border-radius: 16px; font-size: 28px;
+    width: 54px; height: 54px; border-radius: 16px; font-size: 27px;
     display:flex; align-items:center; justify-content:center;
     background: linear-gradient(135deg, var(--c1), var(--c2));
+    box-shadow: 0 8px 22px color-mix(in srgb, var(--c1) 40%, transparent);
 }
-.proj-card h3 { margin: 14px 0 6px 0; font-size: 20px; font-weight: 700; }
-.proj-card p { color:#b4b4c8; font-size: 14px; line-height: 1.6; }
-.status { font-size: 11.5px; font-weight: 600; padding: 4px 10px; border-radius: 999px; }
-.status.ok  { background: rgba(44,182,125,.18); color:#4ade9a; }
-.status.bad { background: rgba(255,90,90,.16);  color:#ff8080; }
+.proj-id { position:relative; z-index:1; font: 500 11px var(--mono); letter-spacing:.12em; color: var(--muted); margin-top: 16px; }
+.proj-card h3 { position:relative; z-index:1; margin: 6px 0 6px 0; font-size: 20px; font-weight: 700; }
+.proj-card p { position:relative; z-index:1; color:#aeb3cf; font-size: 13.5px; line-height: 1.65; }
+.proj-card div { position:relative; z-index:1; }
+.status { font: 600 10.5px var(--mono); letter-spacing:.06em; padding: 4px 10px; border-radius: 999px; }
+.status.ok  { background: rgba(52,211,153,.14); color:#4ade9a; border:1px solid rgba(52,211,153,.35); }
+.status.bad { background: rgba(248,113,113,.12); color:#ff8f8f; border:1px solid rgba(248,113,113,.35); }
 
 .soon-card {
-    min-height: 300px; border: 2px dashed #2f2f48; border-radius: 20px; padding: 22px;
+    min-height: 330px; border: 2px dashed #2a2d45; border-radius: 20px; padding: 22px;
     display:flex; flex-direction:column; align-items:center; justify-content:center;
-    text-align:center; color:#8d8da6;
+    text-align:center; color:#7f84a3; font-family: var(--mono);
 }
 .soon-card .big { font-size: 40px; margin-bottom: 8px; }
 
+/* ---------- Workflow band ---------- */
+.flow { display:grid; grid-template-columns: repeat(5, 1fr); gap: 12px; margin: 6px 0 10px 0; }
+.flow-node {
+    position:relative; padding: 16px 16px 14px 16px; border-radius: 16px;
+    background: var(--panel); border: 1px solid var(--line);
+}
+.flow-node:not(:last-child)::after {
+    content:"→"; position:absolute; right:-11px; top:50%; transform: translateY(-50%);
+    color: var(--c2); font: 700 16px var(--mono); z-index:2;
+}
+.flow-node .n { font: 700 12px var(--mono); color: var(--c2); }
+.flow-node .t { font: 700 16px var(--head); margin: 4px 0 2px 0; }
+.flow-node .s { font-size: 12.5px; color: var(--muted); }
+@media (max-width: 800px) { .flow { grid-template-columns: 1fr 1fr; } .flow-node::after { display:none; } }
+
 /* ---------- Project page hero ---------- */
 .page-hero {
-    display:flex; align-items:center; gap: 20px;
-    padding: 30px 32px; border-radius: 22px; margin-bottom: 22px;
-    background: linear-gradient(120deg, var(--c1), var(--c2));
-    box-shadow: 0 10px 30px rgba(0,0,0,.4);
+    position:relative; overflow:hidden; display:flex; align-items:center; gap: 22px;
+    padding: 28px 32px; border-radius: 22px; margin-bottom: 22px;
+    background:
+        linear-gradient(120deg, color-mix(in srgb, var(--c1) 38%, #0a0c16), color-mix(in srgb, var(--c2) 30%, #0a0c16));
+    border: 1px solid color-mix(in srgb, var(--c1) 55%, transparent);
+    box-shadow: 0 18px 50px rgba(0,0,0,.5), 0 0 40px color-mix(in srgb, var(--c1) 22%, transparent);
+}
+.page-hero .scan {
+    position:absolute; top:0; bottom:0; left:0; width:18%;
+    background: linear-gradient(90deg, transparent, rgba(255,255,255,.10), transparent);
+    animation: scan 5s linear infinite; pointer-events:none;
 }
 .page-icon {
-    font-size: 48px; width: 82px; height: 82px; border-radius: 22px;
+    position:relative; font-size: 44px; width: 78px; height: 78px; border-radius: 20px; flex:none;
     display:flex; align-items:center; justify-content:center;
-    background: rgba(0,0,0,.25);
+    background: rgba(0,0,0,.35); border: 1px solid rgba(255,255,255,.18);
 }
-.page-hero h1 { margin:0; font-size: 34px; font-weight: 800; color:#fff; }
-.page-hero p  { margin:4px 0 0 0; color: rgba(255,255,255,.9); font-size: 15px; }
+.page-hero-text { position:relative; }
+.crumb { font: 500 12.5px var(--mono); color: rgba(255,255,255,.75); }
+.page-hero h1 { margin: 2px 0 0 0; font: 700 34px var(--head); color:#fff; letter-spacing:-.01em; }
+.page-hero p  { margin: 4px 0 0 0; color: rgba(255,255,255,.88); font-size: 15px; }
+.page-tags .chip { background: rgba(0,0,0,.28); border-color: rgba(255,255,255,.2); }
 
 /* ---------- Panels ---------- */
 .panel {
-    background: #14141f; border: 1px solid #25253a; border-radius: 18px;
-    padding: 20px 22px; margin-bottom: 14px;
+    background: linear-gradient(160deg, rgba(255,255,255,.045), rgba(255,255,255,.015));
+    border: 1px solid var(--line); border-radius: 18px; padding: 18px 20px; margin-bottom: 14px;
 }
-.panel h4 { margin: 0 0 10px 0; font-size: 17px; }
-.panel li, .panel p { color:#c3c3d6; font-size: 14px; line-height: 1.7; }
+.panel h4 { margin: 0 0 10px 0; font-size: 16px; }
+.panel li, .panel p { color:#c3c7e0; font-size: 14px; line-height: 1.7; }
+.panel-title {
+    display:flex; align-items:center; gap:9px; font: 600 11px var(--mono);
+    letter-spacing:.16em; color: var(--muted); margin-bottom: 12px;
+}
+.panel-title .dot { width:7px; height:7px; border-radius:50%; background: var(--c2); box-shadow: 0 0 10px var(--c2); }
+.pipe { position:relative; }
+.pipe-step { position:relative; display:flex; gap:14px; align-items:flex-start; padding-bottom: 14px; }
+.pipe-step:not(:last-child)::before {
+    content:""; position:absolute; left:15px; top:32px; bottom:2px; width:1px;
+    background: linear-gradient(var(--c1), transparent);
+}
+.pipe-num {
+    flex:none; width:31px; height:31px; border-radius:10px; display:flex; align-items:center; justify-content:center;
+    font: 700 11.5px var(--mono); color:#fff;
+    background: linear-gradient(135deg, var(--c1), var(--c2));
+}
+.pipe-text { font-size: 13.8px; line-height: 1.55; color:#cdd1e8; padding-top: 5px; }
 
-/* ---------- Result card ---------- */
+/* ---------- Result card (HUD) ---------- */
 .result-card {
-    display:flex; align-items:center; gap: 18px;
+    display:flex; align-items:center; gap: 20px;
     padding: 22px 26px; border-radius: 20px; margin: 10px 0 14px 0;
-    background: linear-gradient(120deg, color-mix(in srgb, var(--rc) 28%, #14141f), #14141f);
+    background: linear-gradient(120deg, color-mix(in srgb, var(--rc) 24%, #0b0d17), #0b0d17);
     border: 1px solid var(--rc);
+    box-shadow: 0 0 34px color-mix(in srgb, var(--rc) 24%, transparent);
 }
 .result-emoji { font-size: 54px; }
-.result-label { font-size: 30px; font-weight: 800; color: var(--rc); line-height: 1.1; }
-.result-sub { color:#c3c3d6; font-size: 14px; margin-top: 4px; }
+.result-kicker { font: 600 10.5px var(--mono); letter-spacing:.18em; color: var(--muted); margin-bottom: 4px; }
+.result-label { font: 800 30px/1.1 var(--head); color: var(--rc); }
+.result-sub { color:#c3c7e0; font: 500 13px var(--mono); margin-top: 6px; }
 
-.bar-row { display:flex; align-items:center; gap: 12px; margin: 9px 0; }
-.bar-name { width: 150px; font-size: 14px; color:#dcdce8; }
-.bar { flex: 1; height: 11px; background:#232336; border-radius: 99px; overflow:hidden; }
-.bar-fill { height:100%; border-radius: 99px; background: linear-gradient(90deg, var(--c1), var(--c2)); }
-.bar-pct { width: 52px; text-align:right; font-size: 13px; color:#b4b4c8; }
+.bar-row { display:flex; align-items:center; gap: 12px; margin: 10px 0; }
+.bar-name { width: 150px; font-size: 13.5px; color:#dcdfef; }
+.bar { flex: 1; height: 10px; background:#1a1c2c; border-radius: 99px; overflow:hidden; }
+.bar-fill {
+    height:100%; border-radius: 99px; transform-origin:left; animation: grow .9s ease-out;
+    background: linear-gradient(90deg, var(--c1), var(--c2)); box-shadow: 0 0 14px color-mix(in srgb, var(--c2) 60%, transparent);
+}
+.bar-pct { width: 56px; text-align:right; font: 500 12.5px var(--mono); color:#b9bed8; }
 
 /* ---------- Support boxes ---------- */
 .support-box {
     padding: 16px 20px; border-radius: 16px; margin-top: 10px;
-    background: rgba(94,150,255,.10); border: 1px solid rgba(94,150,255,.35);
+    background: rgba(94,150,255,.09); border: 1px solid rgba(94,150,255,.35);
     color:#dbe6ff; font-size: 14.5px; line-height: 1.7;
 }
+
+/* ---------- Student list (attendance) ---------- */
+.student-row {
+    display:flex; align-items:center; gap: 12px; margin: 8px 0; padding: 10px 14px; border-radius: 12px;
+    background: rgba(255,255,255,.04); border: 1px solid var(--line);
+}
+.student-avatar {
+    width: 34px; height: 34px; border-radius: 10px; font: 700 14px var(--mono);
+    display:flex; align-items:center; justify-content:center;
+    background: linear-gradient(135deg, var(--c1), var(--c2)); color:#fff;
+}
+.student-name { flex:1; font-size: 14.5px; font-weight: 600; color:#f2f2f7; }
+.student-count { font: 500 12px var(--mono); color:#b4b9d4; }
+.student-count.low { color:#ff9c9c; }
 
 /* ---------- Movie cards ---------- */
 .poster-card {
@@ -356,7 +553,7 @@ st.markdown(
 .poster-card img { width:100%; aspect-ratio: 2/3; object-fit: cover; border-radius: 12px; display:block; }
 .rank-badge {
     position:absolute; top:18px; left:18px; width:38px; height:38px; border-radius:50%;
-    background:#fff; color: var(--m1); font-size:20px; font-weight:800;
+    background:#fff; color: var(--m1); font: 800 19px var(--mono);
     display:flex; align-items:center; justify-content:center;
     box-shadow: 0 3px 10px rgba(0,0,0,.5); z-index:2;
 }
@@ -367,24 +564,63 @@ st.markdown(
     text-shadow: 0 1px 4px rgba(0,0,0,.8);
 }
 
-/* ---------- Inputs & buttons ---------- */
-.stButton > button {
-    width:100%; height:46px; border:none; border-radius:12px;
-    background: linear-gradient(90deg, var(--c1), var(--c2));
-    color:#fff; font-weight:600; font-size:15px; transition:.25s;
+/* ---------- Streamlit widgets ---------- */
+.stButton > button, .stLinkButton > a {
+    width:100%; height:46px; border:none; border-radius:12px; font-weight:600; font-size:14.5px; transition:.25s;
+    background: linear-gradient(90deg, var(--c1), var(--c2)); color:#fff;
+    box-shadow: 0 6px 20px color-mix(in srgb, var(--c1) 30%, transparent);
 }
-.stButton > button:hover { filter: brightness(1.12); transform: translateY(-1px); color:#fff; }
+.stButton > button:hover, .stLinkButton > a:hover {
+    filter: brightness(1.12); transform: translateY(-2px); color:#fff;
+    box-shadow: 0 10px 28px color-mix(in srgb, var(--c2) 38%, transparent);
+}
+.stButton > button:disabled { filter: grayscale(.8); opacity:.45; box-shadow:none; }
 .stTextArea textarea, .stTextInput input, .stNumberInput input {
-    background:#14141f; color:#fff; border:1px solid #2a2a40; border-radius:12px; font-size:15px;
+    background: rgba(255,255,255,.04); color:#fff; border:1px solid var(--line); border-radius:12px; font-size:15px;
+    transition: .2s;
 }
-.stTextArea textarea:focus { border-color: var(--c1); }
-div[data-baseweb="select"] > div { background:#14141f; color:#fff; border-radius:12px; }
-[data-testid="stFileUploaderDropzone"] { background:#14141f; border:1px dashed #3a3a58; border-radius:14px; }
+.stTextArea textarea:focus, .stTextInput input:focus, .stNumberInput input:focus {
+    border-color: var(--c2); box-shadow: 0 0 0 3px color-mix(in srgb, var(--c2) 22%, transparent);
+}
+div[data-baseweb="select"] > div { background: rgba(255,255,255,.04); color:#fff; border-radius:12px; border-color: var(--line); }
+[data-testid="stFileUploaderDropzone"] { background: rgba(255,255,255,.03); border:1px dashed #3a3e63; border-radius:14px; }
 [data-testid="stMetric"] {
-    background:#14141f; border:1px solid #25253a; border-radius:14px; padding:12px 16px;
+    background: var(--panel); border:1px solid var(--line); border-radius:14px; padding:12px 16px;
+}
+[data-testid="stMetricValue"] { font-family: var(--mono); }
+[data-testid="stAlert"] { border-radius: 14px; border: 1px solid var(--line); }
+[data-testid="stExpander"] details { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; }
+.stProgress > div > div > div > div { background: linear-gradient(90deg, var(--c1), var(--c2)); }
+
+/* tabs */
+.stTabs [data-baseweb="tab-list"] { gap: 6px; border-bottom: 1px solid var(--line); }
+.stTabs [data-baseweb="tab"] { border-radius: 10px 10px 0 0; padding: 8px 14px; color: var(--muted); }
+.stTabs [aria-selected="true"] { color:#fff; }
+.stTabs [data-baseweb="tab-highlight"] { background: linear-gradient(90deg, var(--c1), var(--c2)); height: 3px; }
+
+/* segmented control look for horizontal radios in the main area */
+[data-testid="stMain"] [role="radiogroup"], section.main [role="radiogroup"] { gap: 8px; flex-wrap: wrap; }
+[data-testid="stMain"] [role="radiogroup"] label, section.main [role="radiogroup"] label {
+    padding: 7px 16px; border-radius: 999px; background: rgba(255,255,255,.04);
+    border: 1px solid var(--line); transition: .2s;
+}
+[data-testid="stMain"] [role="radiogroup"] label:hover, section.main [role="radiogroup"] label:hover { border-color: var(--c2); }
+[data-testid="stMain"] [role="radiogroup"] label:has(input:checked), section.main [role="radiogroup"] label:has(input:checked) {
+    background: linear-gradient(90deg, color-mix(in srgb, var(--c1) 55%, transparent), color-mix(in srgb, var(--c2) 40%, transparent));
+    border-color: var(--c2);
 }
 
-.footer { text-align:center; color:#7c7c92; font-size:13px; margin: 50px 0 10px 0; }
+.footer { text-align:center; color:#6f7494; font: 500 12.5px var(--mono); margin: 50px 0 10px 0; }
+.footer .prompt { color: var(--c2); }
+
+::-webkit-scrollbar { width: 9px; height: 9px; }
+::-webkit-scrollbar-thumb { background: #272a44; border-radius: 9px; }
+::-webkit-scrollbar-thumb:hover { background: #3a3e63; }
+
+@media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { animation: none !important; transition: none !important; }
+    .typing { width: 100%; }
+}
 </style>
 """,
     unsafe_allow_html=True,
@@ -1106,6 +1342,468 @@ def render_face(p: dict):
 
 
 # =====================================================================
+# 6C. FACE RECOGNITION ATTENDANCE PAGE  (add student -> train -> recognize)
+# =====================================================================
+
+ATT_DATA_DIR = Path(__file__).parent / "Addan_data"   # student photos yahan save hoti hain
+ATT_MODEL_PATH = MODELS_DIR / "face_attendance" / "model1.pkl"
+ATT_IMG_SIZE = (200, 200)
+ATT_MIN_IMAGES = 10   # isse kam photos par accuracy kharab hoti hai
+ATT_AUTO_COUNT = 100     # auto-capture me default kitni photos
+ATT_AUTO_INTERVAL = 0.2  # do photos ke beech ka gap (seconds), taaki angles alag-alag aayein
+ATT_STEPS = ["➕ Add Student", "🗑️ Remove Student", "🧠 Train Model", "🎯 Recognize"]
+ATT_MODES = ["🎥 Auto capture", "📷 One by one", "🖼️ Upload photos"]
+ATT_RTC = {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
+
+
+def att_clean_name(name: str) -> str:
+    """Folder name safe banao (path tricks jaise ../ hata do)."""
+    return re.sub(r"[^\w\- ]", "", name, flags=re.UNICODE).strip()
+
+
+def att_students():
+    if not ATT_DATA_DIR.exists():
+        return []
+    return sorted(d.name for d in ATT_DATA_DIR.iterdir() if d.is_dir())
+
+
+def att_count(name: str) -> int:
+    folder = ATT_DATA_DIR / name
+    return len(list(folder.glob("*.jpg"))) if folder.is_dir() else 0
+
+
+def att_get_faces(frame_bgr):
+    """
+    Haar cascade se faces (largest pehle). Return: [(top, right, bottom, left), ...]
+    """
+    import cv2
+
+    if not hasattr(cv2, "CascadeClassifier"):
+        raise RuntimeError(
+            f"OpenCV {cv2.__version__} has no CascadeClassifier (removed in OpenCV 5). "
+            "FIX: run `pip uninstall -y opencv-python opencv-python-headless opencv-contrib-python` "
+            "and then `pip install \"opencv-python-headless<5\"`, and restart Streamlit."
+        )
+
+    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+    gray = cv2.equalizeHist(gray)
+    boxes = get_face_cascade().detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(60, 60))
+    boxes = sorted(boxes, key=lambda b: b[2] * b[3], reverse=True)
+    return [(int(y), int(x + w), int(y + h), int(x)) for (x, y, w, h) in boxes]
+
+
+def att_preprocess(face_bgr):
+    import cv2
+
+    gray = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2GRAY)
+    gray = cv2.resize(gray, ATT_IMG_SIZE) / 255.0
+    return gray.flatten()
+
+
+def att_save_face(frame, name: str) -> bool:
+    """Frame ka sabse bada face crop karke save karo. Face mila to True."""
+    import cv2
+
+    faces = att_get_faces(frame)
+    if not faces:
+        return False
+    t, r, b, l = faces[0]
+    t, l = max(t, 0), max(l, 0)
+    folder = ATT_DATA_DIR / name
+    folder.mkdir(parents=True, exist_ok=True)
+    # Naya naam: purani photo kabhi overwrite na ho (delete ke baad bhi)
+    idx = att_count(name)
+    while (folder / f"img-{idx}.jpg").exists():
+        idx += 1
+    cv2.imwrite(str(folder / f"img-{idx}.jpg"), frame[t:b, l:r])
+    return True
+
+
+def att_train():
+    """Saari student photos par LogisticRegression train karo. Return: (message, level)."""
+    import cv2
+
+    X, y = [], []
+    for s in att_students():
+        for f in (ATT_DATA_DIR / s).glob("*.jpg"):
+            img = cv2.imread(str(f))
+            if img is None:
+                continue
+            X.append(att_preprocess(img))
+            y.append(s)
+
+    if len(set(y)) < 2:
+        return "Need at least 2 students with images to train.", "error"
+
+    X, y = np.array(X), np.array(y)
+    names, counts = np.unique(y, return_counts=True)
+    few = [f"{n} ({c})" for n, c in zip(names, counts) if c < ATT_MIN_IMAGES]
+
+    acc = None
+    # Validation split tabhi mumkin hai jab har student ki kam se kam 2 photos hon
+    if counts.min() >= 2 and len(X) >= 10:
+        n_test = max(len(names), int(len(X) * 0.2))
+        X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=n_test, stratify=y, random_state=42)
+        check = LogisticRegression(max_iter=1000, class_weight="balanced")
+        check.fit(X_tr, y_tr)
+        acc = check.score(X_te, y_te)
+
+    model = LogisticRegression(max_iter=1000, class_weight="balanced")
+    model.fit(X, y)   # final model saare data par
+    ATT_MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
+    joblib.dump(model, ATT_MODEL_PATH)
+
+    msg = f"Model trained on {len(X)} images of {len(names)} students."
+    msg += (f" Validation accuracy: {acc:.2%}" if acc is not None
+            else " (Validation skipped: not enough images per student.)")
+    if few:
+        msg += "  ⚠️ Very few images for: " + ", ".join(few) + ". Add more for better accuracy."
+    return msg, "success"
+
+
+def att_students_panel(p: dict):
+    students = att_students()
+    if not students:
+        return
+    rows = "".join(
+        H(f"""
+        <div class="student-row">
+            <div class="student-avatar">{html.escape(s[:1].upper())}</div>
+            <div class="student-name">{html.escape(s)}</div>
+            <div class="student-count {'low' if att_count(s) < ATT_MIN_IMAGES else ''}">
+                {att_count(s)} photos
+            </div>
+        </div>
+        """)
+        for s in students
+    )
+    st.markdown(f"<div class='panel'><h4>👥 Registered students ({len(students)})</h4>{rows}</div>",
+                unsafe_allow_html=True)
+
+
+class AttCaptureProcessor(VideoProcessorBase):
+    """
+    Live camera frames par chalta hai (alag thread me, isliye yahan koi st.* call nahi).
+    Naam set ho aur face dikhe to har ATT_AUTO_INTERVAL second me ek face crop save karta hai,
+    jab tak target photos poori na ho jayein.
+    """
+
+    def __init__(self):
+        import cv2
+
+        self.lock = threading.Lock()
+        self.cascade = cv2.CascadeClassifier(
+            cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+        self.name = ""
+        self.target = ATT_AUTO_COUNT
+        self.saved = 0
+        self.last_save = 0.0
+
+    def recv(self, frame):
+        import cv2
+
+        img = frame.to_ndarray(format="bgr24")
+        with self.lock:
+            name, target, saved = self.name, self.target, self.saved
+
+        gray = cv2.equalizeHist(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY))
+        boxes = self.cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(80, 80))
+        box = max(boxes, key=lambda b: b[2] * b[3]) if len(boxes) else None
+
+        done = saved >= target
+        if box is not None and name and not done:
+            now = time.time()
+            if now - self.last_save >= ATT_AUTO_INTERVAL:
+                x, y, w, h = (int(v) for v in box)
+                crop = img[max(y, 0):y + h, max(x, 0):x + w]
+                if crop.size:
+                    folder = ATT_DATA_DIR / name
+                    folder.mkdir(parents=True, exist_ok=True)
+                    cv2.imwrite(str(folder / f"img-auto-{int(now * 1000)}.jpg"), crop)
+                    with self.lock:
+                        self.saved += 1
+                        saved = self.saved
+                    self.last_save = now
+
+        # Overlay: box + status text
+        if not name:
+            status, color = "Enter a name first", (0, 165, 255)
+        elif saved >= target:
+            status, color = f"Done! {saved}/{target} - press STOP", (80, 200, 80)
+        elif box is None:
+            status, color = f"No face found  {saved}/{target}", (60, 60, 255)
+        else:
+            status, color = f"Capturing {saved}/{target}", (255, 120, 60)
+        if box is not None:
+            x, y, w, h = (int(v) for v in box)
+            cv2.rectangle(img, (x, y), (x + w, y + h), color, 2)
+        cv2.putText(img, status, (12, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2, cv2.LINE_AA)
+
+        return av.VideoFrame.from_ndarray(img, format="bgr24")
+
+
+@st.fragment(run_every=1)
+def att_auto_progress(ctx, target: int, name: str):
+    """Har second progress bar update karta hai (sirf ye hissa dobara chalta hai)."""
+    notified_key = "att_auto_notified"
+    proc = ctx.video_processor if ctx.state.playing else None
+    if proc is None:
+        st.session_state[notified_key] = False
+        st.caption("Press **START** above, allow camera access and slowly turn your face "
+                   "left, right, up and down. Photos are captured automatically.")
+        return
+
+    saved = proc.saved
+    st.progress(min(saved / max(target, 1), 1.0),
+                text=f"{saved} / {target} photos captured for {name}")
+    if saved >= target and not st.session_state.get(notified_key):
+        st.session_state[notified_key] = True
+        st.session_state.att_flash = (
+            "success", f"✅ {saved} photos captured for {name}. Press STOP, then train the model.")
+        st.rerun()   # poori app refresh: student list me nayi count dikhe
+
+
+def att_mode_auto(name: str):
+    if not WEBRTC_OK:
+        st.error("Auto capture needs two extra packages. Run this in your terminal and restart Streamlit:")
+        st.code("pip install streamlit-webrtc av", language="bash")
+        return
+
+    target = int(st.number_input("Photos to capture", min_value=20, max_value=300,
+                                 value=ATT_AUTO_COUNT, step=10, key="att_auto_target"))
+    ctx = webrtc_streamer(
+        key="att_auto_cam",
+        mode=WebRtcMode.SENDRECV,
+        video_processor_factory=AttCaptureProcessor,
+        rtc_configuration=ATT_RTC,
+        media_stream_constraints={"video": True, "audio": False},
+        async_processing=True,
+    )
+    if ctx.video_processor:
+        with ctx.video_processor.lock:   # naam / target live update (rerun par)
+            ctx.video_processor.name = name
+            ctx.video_processor.target = target
+    att_auto_progress(ctx, target, name)
+    st.caption("Tip: good light, and move your head slowly. To capture another batch, press STOP and START again.")
+
+
+def att_mode_single(name: str):
+    shot = st.camera_input("Take a photo", key=f"att_cam_{st.session_state.att_cam_key}",
+                           label_visibility="collapsed")
+    if shot is not None:
+        try:
+            saved = att_save_face(decode_image(shot.getvalue()), name)
+        except Exception as e:
+            st.error(f"An error occurred during processing: {e}")
+            saved = None
+        if saved:
+            st.session_state.att_flash = ("success", "✅ Face saved! Take the next photo.")
+            st.session_state.att_cam_key += 1   # camera widget reset
+            st.rerun()
+        elif saved is False:
+            st.error("😕 No face found. Try again with a clear, front-facing photo.")
+
+
+def att_mode_upload(name: str):
+    files = st.file_uploader("Upload multiple photos", type=["jpg", "jpeg", "png"],
+                             accept_multiple_files=True, key="att_files",
+                             label_visibility="collapsed")
+    if files and st.button(f"💾 Save {len(files)} uploaded photos", key="att_save_up"):
+        ok = 0
+        try:
+            for f in files:
+                ok += bool(att_save_face(decode_image(f.getvalue()), name))
+        except Exception as e:
+            st.error(f"An error occurred during processing: {e}")
+        else:
+            st.session_state.att_flash = (
+                "success", f"✅ Saved {ok}/{len(files)} photos (the rest had no face).")
+            st.rerun()
+
+
+def att_step_add(p: dict):
+    st.markdown("##### 👤 Student details")
+    raw = st.text_input("Student name", key="att_name", placeholder="e.g. Rahul Sharma")
+    name = att_clean_name(raw)
+    if raw.strip() and name != raw.strip():
+        st.caption(f"Special characters removed. Saving as: **{name}**")
+
+    if not name:
+        st.warning("Enter a name to begin.")
+        return
+
+    st.info(f"Photos saved for **{name}**: {att_count(name)}. "
+            "More photos with different angles and lighting give better accuracy.")
+
+    mode = st.radio("Capture mode", ATT_MODES, horizontal=True, key="att_mode",
+                    label_visibility="collapsed")
+    if mode == ATT_MODES[0]:
+        att_mode_auto(name)
+    elif mode == ATT_MODES[1]:
+        att_mode_single(name)
+    else:
+        att_mode_upload(name)
+
+
+def att_step_remove(p: dict):
+    st.markdown("##### 🗑️ Remove a student")
+    students = att_students()
+    if not students:
+        st.info("No students registered yet.")
+        return
+
+    sel = st.selectbox("Select student", students, key="att_remove_sel")
+    n = att_count(sel)
+    st.warning(f"This will permanently delete **{sel}** and all {n} saved photos.")
+    confirm = st.checkbox("Yes, I want to delete this student", key=f"att_confirm_{sel}")
+
+    if st.button("🗑️ Remove student", key="att_remove_go", disabled=not confirm):
+        # Safety: sirf wahi naam hatao jo sach me Addan_data ke andar registered hai
+        if sel in att_students():
+            shutil.rmtree(ATT_DATA_DIR / sel, ignore_errors=True)
+            msg = f"🗑️ Removed {sel} ({n} photos)."
+            if ATT_MODEL_PATH.exists():
+                msg += " Train the model again so this student is no longer recognized."
+            st.session_state.att_flash = ("success", msg)
+            st.rerun()
+
+
+def att_step_train(p: dict):
+    students = att_students()
+    st.markdown("##### 🧠 Train the recognizer")
+    m1, m2 = st.columns(2)
+    m1.metric("Students found", len(students))
+    m2.metric("Total photos", sum(att_count(s) for s in students))
+
+    if ATT_MODEL_PATH.exists():
+        st.caption("A trained model already exists. Training again will replace it.")
+
+    if st.button("🚀 Train now", key="att_train_go"):
+        try:
+            with st.spinner("Training..."):
+                msg, level = att_train()
+        except Exception as e:
+            st.error(f"An error occurred during training: {e}")
+            return
+        getattr(st, level)(msg)
+
+
+def att_step_predict(p: dict):
+    import cv2
+
+    st.markdown("##### 🎯 Who is this?")
+    if not ATT_MODEL_PATH.exists():
+        st.warning("Train the model first (step 2).")
+        return
+
+    model = joblib.load(ATT_MODEL_PATH)   # cache nahi: retrain ke baad hamesha naya model mile
+    current = set(att_students())
+    stale = [str(c) for c in model.classes_ if str(c) not in current]
+    if stale:
+        st.warning("The model still knows removed students (" + ", ".join(stale)
+                   + "). Train the model again to forget them.")
+    shot = st.camera_input("Take a photo to recognize", key="att_pred_cam",
+                           label_visibility="collapsed")
+    if shot is None:
+        return
+
+    try:
+        frame = decode_image(shot.getvalue())
+        faces = att_get_faces(frame)
+    except Exception as e:
+        st.error(f"An error occurred during processing: {e}")
+        return
+
+    if not faces:
+        st.error("😕 No face detected. Try a clear, front-facing photo with good light.")
+        return
+
+    h, w = frame.shape[:2]
+    scale = max(0.6, min(h, w) / 700)
+    thick = max(2, int(round(scale * 2)))
+    c1, c2 = p["colors"]
+    bgr = hex_to_bgr(c1)
+    results = []
+
+    for t, r, b, l in faces:
+        t, l = max(t, 0), max(l, 0)
+        b, r = min(b, h), min(r, w)
+        crop = frame[t:b, l:r]
+        if crop.size == 0:
+            continue
+        vec = att_preprocess(crop)
+        probs = model.predict_proba([vec])[0]
+        best = int(np.argmax(probs))
+        name, conf = str(model.classes_[best]), float(probs[best])
+        scores = sorted(((str(c), float(pr)) for c, pr in zip(model.classes_, probs)),
+                        key=lambda s: -s[1])
+        results.append((name, conf, scores, cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)))
+
+        label = f"{name} ({conf:.0%})"
+        cv2.rectangle(frame, (l, t), (r, b), bgr, thick)
+        (tw, th), base = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, scale, thick)
+        y0 = max(t - th - base - 8, 0)
+        cv2.rectangle(frame, (l, y0), (l + tw + 12, y0 + th + base + 8), bgr, -1)
+        cv2.putText(frame, label, (l + 6, y0 + th + 3), cv2.FONT_HERSHEY_SIMPLEX,
+                    scale, (255, 255, 255), thick, cv2.LINE_AA)
+
+    st.markdown("---")
+    st.image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), use_container_width=True)
+
+    for i, (name, conf, scores, thumb) in enumerate(results[:6], start=1):
+        c_img, c_res = st.columns([1, 4], gap="medium")
+        with c_img:
+            st.image(thumb, use_container_width=True)
+        with c_res:
+            title = name if len(results) == 1 else f"Face {i}: {name}"
+            result_card("🎓", c1, title, f"Confidence: {conf * 100:.1f}%")
+            prob_bars(scores)
+    if len(results) > 6:
+        st.caption(f"Showing details for the first 6 of {len(results)} faces.")
+
+
+def render_attendance(p: dict):
+    page_hero(p)
+
+    try:
+        import cv2  # noqa: F401
+    except ImportError:
+        st.error("The `opencv-python` package is not installed. Run this in your terminal:")
+        st.code("pip install opencv-python-headless", language="bash")
+        return
+
+    if "att_cam_key" not in st.session_state:
+        st.session_state.att_cam_key = 0
+
+    st.info(p["disclaimer"])
+
+    left, right = st.columns([3, 2], gap="large")
+
+    with left:
+        # tabs ki jagah radio: ek time par sirf ek camera widget chalta hai
+        step = st.radio("Step", ATT_STEPS, horizontal=True, key="att_step",
+                        label_visibility="collapsed")
+        flash = st.session_state.pop("att_flash", None)
+        if flash:
+            getattr(st, flash[0])(flash[1])
+
+        if step == ATT_STEPS[0]:
+            att_step_add(p)
+        elif step == ATT_STEPS[1]:
+            att_step_remove(p)
+        elif step == ATT_STEPS[2]:
+            att_step_train(p)
+        else:
+            att_step_predict(p)
+
+    with right:
+        how_panel(p)
+        att_students_panel(p)
+
+    footer()
+
+
+# =====================================================================
 # 7. PROJECTS REGISTRY  (naya project yahan add karein)
 # =====================================================================
 
@@ -1271,6 +1969,30 @@ PROJECTS = {
         ],
     },
     # ----------------------------------------------------------------
+    "attendance": {
+        "key": "attendance",
+        "icon": "🎓",
+        "title": "Face Recognition Attendance",
+        "tagline": "Add students, train the model and recognize who is in front of the camera.",
+        "desc": "End-to-end face recognition: register students with camera or uploaded photos, "
+                "train a Logistic Regression model in one click and identify faces with confidence scores.",
+        "colors": ("#6366f1", "#f43f5e"),
+        "tags": ["Computer Vision", "OpenCV", "Face Recognition", "Logistic Regression"],
+        "render": render_attendance,
+        "files": {"model": ATT_MODEL_PATH},
+        "required": [],   # model app ke andar train hota hai, isliye file ki zarurat nahi
+        "disclaimer": "This is a learning demo. Face photos you add are stored in the 'Addan_data' "
+                      "folder next to this app, so only register people who have agreed to it. "
+                      "Accuracy depends on how many clear photos each student has.",
+        "how": [
+            "Add Student: enter a name, press START and 100 face photos are captured automatically.",
+            "Remove Student: delete a student and all their photos anytime.",
+            "Train Model: one click trains a Logistic Regression on all photos.",
+            "Recognize: take a photo and see the name with a confidence score.",
+            "Faces are marked with a box and name on the photo.",
+        ],
+    },
+    # ----------------------------------------------------------------
     # NAYA PROJECT ADD KARNA HO TO IS TEMPLATE KO COPY KARO:
     #
     # "spam": {
@@ -1305,24 +2027,28 @@ if "page" not in st.session_state:
     st.session_state.page = HOME
 
 with st.sidebar:
+    initials = "".join(w[0] for w in PROFILE["name"].split()[:2]).upper()
     st.markdown(
         H(f"""
         <div class="side-logo">
-            
+            <div class="avatar"><span>{html.escape(initials)}</span></div>
             <div class="name">{html.escape(PROFILE['name'])}</div>
-            <div class="role">{html.escape(PROFILE['role'])}</div>
+            <div class="role">&gt; {html.escape(PROFILE['role'])}</div>
         </div>
         """),
         unsafe_allow_html=True,
     )
-    st.divider()
+    st.markdown("<div class='side-label'>NAVIGATION</div>", unsafe_allow_html=True)
     st.radio("Navigation", list(LABELS), key="page", label_visibility="collapsed")
-    st.divider()
-    st.caption("MODEL STATUS")
+    st.markdown("<div class='side-label'>SYSTEM STATUS</div>", unsafe_allow_html=True)
     for p in PROJECTS.values():
-        dot = "🟢" if project_ready(p) else "🔴"
-        st.markdown(f"<div class='side-status'>{dot} {html.escape(p['title'])}</div>",
-                    unsafe_allow_html=True)
+        ok = project_ready(p)
+        st.markdown(
+            f"<div class='side-status'><span class='led {'on' if ok else 'off'}'></span>"
+            f"{html.escape(p['title'])}"
+            f"<span class='side-state'>{'READY' if ok else 'NO MODEL'}</span></div>",
+            unsafe_allow_html=True,
+        )
 
 # =====================================================================
 # 9. HOME PAGE
@@ -1330,29 +2056,45 @@ with st.sidebar:
 
 
 def render_home():
-    theme("#7f5af0", "#2cb67d")
+    theme("#8b5cf6", "#22d3ee")
 
     st.markdown(
         H(f"""
         <div class="hero">
-            <div class="hero-hi">👋 Hello, I'm</div>
-            <h1>{html.escape(PROFILE['name'])}</h1>
-            <div class="hero-role">{html.escape(PROFILE['role'])}</div>
-            <p>{html.escape(PROFILE['about'])}</p>
-            <div style="margin-top:14px">{chips(PROFILE['skills'])}</div>
+            <div class="term-bar"><i></i><i></i><i></i><b>{html.escape(PROFILE['name'].split()[0].lower())}@ai-lab: ~/portfolio</b></div>
+            <div class="hero-body">
+                <div class="hero-left">
+                    <div class="hero-cmd">$ <span class="typing">python run_portfolio.py --live</span></div>
+                    <div class="hero-hi">Hello world, I'm</div>
+                    <h1>{html.escape(PROFILE['name'])}</h1>
+                    <div class="hero-role">&gt; {html.escape(PROFILE['role'])}</div>
+                    <p>{html.escape(PROFILE['about'])}</p>
+                    <div style="margin-top:14px">{chips(PROFILE['skills'])}</div>
+                </div>
+                <div class="hero-right">{neural_svg()}</div>
+            </div>
         </div>
         """),
         unsafe_allow_html=True,
     )
 
     ready = sum(project_ready(p) for p in PROJECTS.values())
-    m1, m2, m3 = st.columns(3)
-    m1.metric("Projects", len(PROJECTS))
-    m2.metric("Live demos ready", ready)
-    m3.metric("Domain", "NLP, ML, CV")
+    stats = [
+        (f"{len(PROJECTS):02d}", "AI projects"),
+        (f"{ready:02d}", "Live demos"),
+        ("03", "Text · Audio · Vision"),
+        ("100%", "Python stack"),
+    ]
+    st.markdown(
+        H("<div class='stat-row'>" + "".join(
+            f"<div class='stat'><div class='v'>{v}</div><div class='l'>{html.escape(l)}</div></div>"
+            for v, l in stats) + "</div>"),
+        unsafe_allow_html=True,
+    )
 
-    st.markdown("<div class='section-title'>🧪 Featured Projects</div>", unsafe_allow_html=True)
-    st.markdown("<div class='section-sub'>Click a project to try the live demo.</div>",
+    st.markdown("<div class='section-title'><span class='mono'>//</span> Featured Projects</div>",
+                unsafe_allow_html=True)
+    st.markdown("<div class='section-sub'>Open a project to try the live model demo.</div>",
                 unsafe_allow_html=True)
 
     items = list(PROJECTS.items())
@@ -1362,13 +2104,15 @@ def render_home():
         for col, (k, p) in zip(cols, chunk):
             c1, c2 = p["colors"]
             ok = project_ready(p)
-            badge = "<span class='status ok'>● Live</span>" if ok else \
-                    "<span class='status bad'>● Model missing</span>"
+            num = list(PROJECTS).index(k) + 1
+            badge = "<span class='status ok'>● LIVE</span>" if ok else \
+                    "<span class='status bad'>● NO MODEL</span>"
             with col:
                 st.markdown(
                     H(f"""
                     <div class="proj-card" style="--c1:{c1}; --c2:{c2};">
                         <div class="proj-top"><div class="proj-icon">{p['icon']}</div>{badge}</div>
+                        <div class="proj-id">MODEL_{num:02d} · {html.escape(p['tags'][0].upper())}</div>
                         <h3>{html.escape(p['title'])}</h3>
                         <p>{html.escape(p['desc'])}</p>
                         <div>{chips(p['tags'])}</div>
@@ -1392,7 +2136,20 @@ def render_home():
                 )
         st.markdown("<div style='height:14px'></div>", unsafe_allow_html=True)
 
-    st.markdown("<div class='section-title'>📬 Get in touch</div>", unsafe_allow_html=True)
+    flow = [("01", "Data", "Collect & clean"), ("02", "Features", "Vectorize / extract"),
+            ("03", "Model", "Train & evaluate"), ("04", "Serve", "Streamlit interface"),
+            ("05", "Demo", "Try it live")]
+    st.markdown("<div class='section-title'><span class='mono'>//</span> How I ship a model</div>",
+                unsafe_allow_html=True)
+    st.markdown(
+        H("<div class='flow'>" + "".join(
+            f"<div class='flow-node'><div class='n'>{n}</div><div class='t'>{t}</div>"
+            f"<div class='s'>{s}</div></div>" for n, t, s in flow) + "</div>"),
+        unsafe_allow_html=True,
+    )
+
+    st.markdown("<div class='section-title'><span class='mono'>//</span> Get in touch</div>",
+                unsafe_allow_html=True)
     link_cols = st.columns(len(PROFILE["links"]))
     for col, (name, url) in zip(link_cols, PROFILE["links"].items()):
         with col:
