@@ -1,0 +1,19 @@
+streamlit>=1.40
+numpy
+pandas
+scipy
+scikit-learn
+joblib
+requests
+
+# Speech Mental Health Detection
+librosa
+soundfile
+
+# Face Gender Detection + Face Recognition Attendance
+# (<5 because OpenCV 5 removed the Haar cascade face detector)
+opencv-python-headless<5
+
+# Attendance: automatic live-camera capture
+streamlit-webrtc
+av
