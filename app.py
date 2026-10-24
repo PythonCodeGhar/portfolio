@@ -30,7 +30,8 @@ except Exception:   # package install nahi hai -> baaki app chalta rahe
 # 1. SETTINGS  (yahan apni details badlein)
 # =====================================================================
 
-MODELS_DIR = Path(__file__).parent / "models"
+BASE_DIR = Path(__file__).resolve().parent      # jis folder me app.py hai (GitHub / Streamlit Cloud par bhi)
+MODELS_DIR = BASE_DIR / "models"
 
 
 LEGACY_DIR = Path(r"D:\ai_agentic\ai_conda")
@@ -94,12 +95,31 @@ def chips(items):
     return "".join(f'<span class="chip">{html.escape(str(t))}</span>' for t in items)
 
 
+_SKIP_DIRS = {".git", "__pycache__", "node_modules", "venv", ".venv", "env", "site-packages"}
+
+
+def find_by_name(name: str):
+    """app.py wale folder (aur uske andar ke sab folders) me file naam se dhundo."""
+    direct = [BASE_DIR / name, MODELS_DIR / name]
+    for c in direct:
+        if c.is_file():
+            return c
+    for hit in BASE_DIR.rglob(name):
+        if hit.is_file() and not (set(hit.relative_to(BASE_DIR).parts) & _SKIP_DIRS):
+            return hit
+    return None
+
+
 def pick(*paths) -> Path:
-    """Diye gaye paths me se pehla jo exist kare wo lo, warna pehla path (error me dikhane ke liye)."""
+    """
+    Diye gaye paths me se pehla jo exist kare wo lo. Nahi mila to app.py ke folder me
+    (subfolders me bhi) wahi file naam se dhundo. Phir bhi na mile to pehla path (error me dikhane ke liye).
+    """
     for p in paths:
         if Path(p).exists():
             return Path(p)
-    return Path(paths[0])
+    found = find_by_name(Path(paths[0]).name)
+    return found if found else Path(paths[0])
 
 
 @st.cache_resource(show_spinner="Loading model...")
@@ -114,8 +134,10 @@ def files_ready(paths) -> bool:
 def require_files(paths) -> bool:
     missing = [str(p) for p in paths if not Path(p).exists()]
     if missing:
-        st.error("Model file not found. Please place it at this path:")
-        st.code("\n".join(missing), language="text")
+        st.error("Model file not found. Put it in the same folder as app.py "
+                 "(or inside its `models/` folder) and make sure it is committed to GitHub.")
+        st.code("app.py folder:  " + str(BASE_DIR) + "\n\nLooked for:\n" + "\n".join(missing),
+                language="text")
         return False
     return True
 
@@ -1875,8 +1897,10 @@ PROJECTS = {
         "tags": ["Speech", "Audio ML", "Librosa", "MFCC", "Scikit-learn"],
         "render": render_speech,
         "files": {
-            "model": MODELS_DIR / "best_model.pkl",
-            "label_encoder": MODELS_DIR /  "label_encoder.pkl",
+            "model": pick(MODELS_DIR / "speech_mental_health" / "best_model.pkl",
+                          MODELS_DIR / "best_model.pkl"),
+            "label_encoder": pick(MODELS_DIR / "speech_mental_health" / "label_encoder.pkl",
+                                  MODELS_DIR / "label_encoder.pkl"),
         },
         "required": ["model"],   # label_encoder na ho to app khud bana leta hai
         "label_style": {
