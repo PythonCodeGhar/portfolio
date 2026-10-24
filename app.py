@@ -1221,7 +1221,7 @@ def detect_faces(frame_bgr):
 
     gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
     boxes = get_face_cascade().detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(60, 60))
-    return [(int(y), int(x + w), int(y + h), int(x)) for x, y, w, h in boxes], "OpenCV Haar cascade"
+    return [(int(y), int(x + w), int(y + h), int(x)) for x, y, w, h in boxes], "OpenCV Face recoginitation"
 
 
 def predict_faces(frame, model, p: dict):
