@@ -1645,7 +1645,7 @@ def att_mode_upload(name: str):
 
 def att_step_add(p: dict):
     st.markdown("##### 👤 Student details")
-    raw = st.text_input("Student name", key="att_name", placeholder="e.g. Rahul Sharma")
+    raw = st.text_input("Student name", key="att_name", placeholder="e.g. Ankit Kumar")
     name = att_clean_name(raw)
     if raw.strip() and name != raw.strip():
         st.caption(f"Special characters removed. Saving as: **{name}**")
