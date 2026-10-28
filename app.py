@@ -1,3 +1,44 @@
+"""
+AI / NLP PORTFOLIO  -  Streamlit
+
+Projects:
+  1. Food Review System              (text  -> sentiment)
+  2. Movie Recommendation System     (movie -> similar movies + posters)
+  3. Speech Mental Health Detection  (audio -> Normal / Anxious / Depressed)
+  4. Fake News Detection             (text  -> Real / Fake)
+  5. Face Gender Detection           (photo -> detect faces -> Female / Male)
+  6. Face Recognition Attendance     (add student -> train -> recognize face)
+  7. Object Detection (YOLOv4)       (photo / live webcam -> 80 object types)
+
+Naya project add karna ho to file ke neeche PROJECTS dict me entry add karein.
+
+Folder structure:
+    Project/
+    ├── app.py
+    ├── requirements.txt               (+ streamlit-webrtc, av  for auto capture)
+    ├── Addan_data/                    (attendance project: student photos, app khud banata hai)
+    │   └── <student name>/img-0.jpg ...
+    └── models/
+        ├── food_review/
+        │   └── final_rev_data.pkl
+        ├── movie_recommender/
+        │   ├── model.pkl
+        │   ├── vectors.pkl
+        │   └── dataframe.pkl
+        ├── speech_mental_health/
+        │   ├── best_model.pkl
+        │   └── label_encoder.pkl      (optional, na ho to app khud bana lega)
+        ├── news_classifier/
+        │   └── Fakenews.pkl
+        ├── face_attendance/
+        │   └── model1.pkl             (Train page se khud ban jaata hai)
+        ├── object_detection/
+        │   ├── yolov4.weights         (ya yolov4-tiny.weights, tez chalta hai)
+        │   ├── yolov4.cfg             (ya yolov4-tiny.cfg)
+        │   └── objects_list.txt       (optional, na ho to 80 COCO naam built-in hain)
+        └── face_gender_model.pkl      (ya face_gender/model.pkl)
+"""
+
 import html
 import io
 import os
@@ -2009,6 +2050,55 @@ def obj_live_stats(ctx):
                     unsafe_allow_html=True)
 
 
+# GitHub par 100 MB se badi file push nahi hoti, isliye model online se download ho sakta hai
+OBJ_DIR = MODELS_DIR / "object_detection"
+OBJ_DOWNLOADS = {
+    "YOLOv4-tiny  (24 MB, fast, good for live webcam)": {
+        "yolov4-tiny.weights": "https://github.com/AlexeyAB/darknet/releases/download/yolov4/yolov4-tiny.weights",
+        "yolov4-tiny.cfg": "https://raw.githubusercontent.com/AlexeyAB/darknet/master/cfg/yolov4-tiny.cfg",
+    },
+    "YOLOv4 full  (245 MB, most accurate, slow on CPU)": {
+        "yolov4.weights": "https://github.com/AlexeyAB/darknet/releases/download/yolov4/yolov4.weights",
+        "yolov4.cfg": "https://raw.githubusercontent.com/AlexeyAB/darknet/master/cfg/yolov4.cfg",
+    },
+}
+
+
+def download_file(url: str, dest: Path, bar=None, label=""):
+    """Stream download: pehle .part file me likhta hai, poora hone par naam badalta hai."""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_name(dest.name + ".part")
+    with requests.get(url, stream=True, timeout=60, headers=HEADERS) as r:
+        r.raise_for_status()
+        total = int(r.headers.get("content-length", 0))
+        done = 0
+        with open(tmp, "wb") as fh:
+            for chunk in r.iter_content(chunk_size=1 << 20):
+                fh.write(chunk)
+                done += len(chunk)
+                if bar is not None and total:
+                    bar.progress(min(done / total, 1.0), text=f"{label}  {done / 1e6:.0f} / {total / 1e6:.0f} MB")
+    tmp.replace(dest)
+
+
+def obj_download_ui():
+    """Model files nahi mile to download ka option dikhao."""
+    st.warning("YOLO model files were not found. GitHub does not accept files over 100 MB, so you can "
+               "let the app download them from the official release instead (done once, then reused).")
+    choice = st.selectbox("Which model?", list(OBJ_DOWNLOADS), key="obj_dl_choice")
+    if st.button("⬇️ Download model now", key="obj_dl_go"):
+        try:
+            for fname, url in OBJ_DOWNLOADS[choice].items():
+                bar = st.progress(0.0, text=f"{fname} ...")
+                download_file(url, OBJ_DIR / fname, bar, fname)
+                bar.empty()
+        except Exception as e:
+            st.error(f"Download failed: {e}")
+            return
+        st.rerun()   # poori script dobara chalegi aur nayi files mil jaayengi
+    st.caption("Or put yolov4.weights + yolov4.cfg manually inside the `models/object_detection/` folder.")
+
+
 OBJ_MODES = ["📷 Take photo", "📁 Upload image", "🎥 Live webcam"]
 
 
@@ -2016,7 +2106,9 @@ def render_objects(p: dict):
     page_hero(p)
 
     f = p["files"]
-    if not require_files([f["weights"], f["cfg"]]):
+    if not files_ready([f["weights"], f["cfg"]]):
+        obj_download_ui()
+        footer()
         return
 
     # Git LFS ke bina upload karne par .weights ki jagah chhoti text file aa jaati hai
