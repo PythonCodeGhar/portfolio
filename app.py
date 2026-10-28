@@ -1221,7 +1221,7 @@ def detect_faces(frame_bgr):
 
     gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
     boxes = get_face_cascade().detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(60, 60))
-    return [(int(y), int(x + w), int(y + h), int(x)) for x, y, w, h in boxes], "OpenCV Face recoginitation"
+    return [(int(y), int(x + w), int(y + h), int(x)) for x, y, w, h in boxes], "OpenCV Haar cascade"
 
 
 def predict_faces(frame, model, p: dict):
@@ -1645,7 +1645,7 @@ def att_mode_upload(name: str):
 
 def att_step_add(p: dict):
     st.markdown("##### 👤 Student details")
-    raw = st.text_input("Student name", key="att_name", placeholder="e.g. Ankit Kumar")
+    raw = st.text_input("Student name", key="att_name", placeholder="e.g. Rahul Sharma")
     name = att_clean_name(raw)
     if raw.strip() and name != raw.strip():
         st.caption(f"Special characters removed. Saving as: **{name}**")
@@ -1821,6 +1821,327 @@ def render_attendance(p: dict):
     with right:
         how_panel(p)
         att_students_panel(p)
+
+    footer()
+
+
+# =====================================================================
+# 6D. OBJECT DETECTION PAGE  (YOLOv4 + OpenCV DNN: photo / live webcam)
+# =====================================================================
+
+OBJ_INPUT_SIZES = [320, 416, 512, 608]   # YOLO input 32 ka multiple hona chahiye
+OBJ_LOCK = threading.Lock()              # cached net ko ek time par ek hi thread use kare
+
+# Darknet "coco.names": agar objects_list.txt na mile to ye 80 naam use hote hain
+COCO_NAMES = (
+    "person,bicycle,car,motorbike,aeroplane,bus,train,truck,boat,traffic light,fire hydrant,"
+    "stop sign,parking meter,bench,bird,cat,dog,horse,sheep,cow,elephant,bear,zebra,giraffe,"
+    "backpack,umbrella,handbag,tie,suitcase,frisbee,skis,snowboard,sports ball,kite,"
+    "baseball bat,baseball glove,skateboard,surfboard,tennis racket,bottle,wine glass,cup,"
+    "fork,knife,spoon,bowl,banana,apple,sandwich,orange,broccoli,carrot,hot dog,pizza,donut,"
+    "cake,chair,sofa,pottedplant,bed,diningtable,toilet,tvmonitor,laptop,mouse,remote,"
+    "keyboard,cell phone,microwave,oven,toaster,sink,refrigerator,book,clock,vase,scissors,"
+    "teddy bear,hair drier,toothbrush"
+).split(",")
+
+
+def load_class_names(path) -> list:
+    """objects_list.txt (har line me ek naam). File na ho to built-in COCO names."""
+    path = Path(path)
+    if path.is_file():
+        names = [ln.strip() for ln in path.read_text(encoding="utf-8", errors="ignore").splitlines()]
+        names = [n for n in names if n]
+        if names:
+            return names
+    return COCO_NAMES
+
+
+def obj_color(class_id: int):
+    """Har class ka apna fixed rang (BGR)."""
+    import colorsys
+
+    r, g, b = colorsys.hsv_to_rgb((class_id * 0.618034) % 1.0, 0.7, 1.0)
+    return (int(b * 255), int(g * 255), int(r * 255))
+
+
+def obj_bgr_to_hex(bgr) -> str:
+    return "#%02x%02x%02x" % (bgr[2], bgr[1], bgr[0])
+
+
+def build_yolo(weights: str, cfg: str, size: int):
+    import cv2
+
+    net = cv2.dnn_DetectionModel(weights, cfg)
+    net.setInputSize(size, size)
+    net.setInputScale(1 / 255)
+    net.setInputSwapRB(True)   # OpenCV BGR deta hai, YOLO RGB par train hua hai (original code me nahi tha)
+    return net
+
+
+@st.cache_resource(show_spinner="Loading YOLO model...")
+def load_yolo(weights: str, cfg: str, size: int):
+    return build_yolo(weights, cfg, size)
+
+
+def yolo_detect(net, img, conf: float, nms: float):
+    """Return: [(class_id, score, (x, y, w, h)), ...]  (khaali list agar kuch na mile)."""
+    ids, scores, boxes = net.detect(img, confThreshold=conf, nmsThreshold=nms)
+    if len(ids) == 0:
+        return []
+    ids = np.array(ids).flatten()
+    scores = np.array(scores).flatten()
+    return [(int(i), float(sc), tuple(int(v) for v in b)) for i, sc, b in zip(ids, scores, boxes)]
+
+
+def draw_detections(img, dets, names, allow=None):
+    """Boxes + labels banao. Return: (annotated BGR image, [(name, score, bgr), ...])."""
+    import cv2
+
+    out = img.copy()
+    h, w = out.shape[:2]
+    scale = max(0.5, min(h, w) / 800)
+    thick = max(2, int(round(scale * 2)))
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    shown = []
+
+    for cid, score, (x, y, bw, bh) in dets:
+        name = names[cid] if 0 <= cid < len(names) else f"class {cid}"
+        if allow and name not in allow:
+            continue
+        col = obj_color(cid)
+        cv2.rectangle(out, (x, y), (x + bw, y + bh), col, thick)
+
+        label = f"{name} {score:.0%}"
+        fs, ft = scale * 0.7, max(1, thick - 1)
+        (tw, th), base = cv2.getTextSize(label, font, fs, ft)
+        y0 = max(y - th - base - 6, 0)
+        cv2.rectangle(out, (x, y0), (x + tw + 10, y0 + th + base + 6), col, -1)
+        cv2.putText(out, label, (x + 5, y0 + th + 2), font, fs, (0, 0, 0), ft, cv2.LINE_AA)
+        shown.append((name, score, col))
+    return out, shown
+
+
+class YoloProcessor(VideoProcessorBase):
+    """Live webcam: har frame par YOLO chalata hai (alag thread me, isliye yahan koi st.* call nahi)."""
+
+    def __init__(self, weights, cfg, names, size):
+        self.lock = threading.Lock()
+        self.net = build_yolo(weights, cfg, size)   # apna net: cached wale se alag
+        self.names = names
+        self.size = size
+        self.conf, self.nms, self.allow = 0.5, 0.5, set()
+        self.found = 0
+        self.counts = {}
+        self.fps = 0.0
+        self._t = time.time()
+
+    def recv(self, frame):
+        import cv2
+
+        img = frame.to_ndarray(format="bgr24")
+        with self.lock:
+            conf, nms, allow, size = self.conf, self.nms, set(self.allow), self.size
+
+        try:
+            self.net.setInputSize(size, size)
+            dets = yolo_detect(self.net, img, conf, nms)
+        except Exception:
+            dets = []
+        out, shown = draw_detections(img, dets, self.names, allow)
+
+        now = time.time()
+        inst = 1.0 / max(now - self._t, 1e-3)
+        self._t = now
+        self.fps = inst if self.fps == 0 else 0.9 * self.fps + 0.1 * inst
+
+        counts = {}
+        for name, _, _ in shown:
+            counts[name] = counts.get(name, 0) + 1
+        with self.lock:
+            self.found, self.counts = len(shown), counts
+
+        cv2.putText(out, f"{self.fps:4.1f} FPS | {len(shown)} objects", (12, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2, cv2.LINE_AA)
+        return av.VideoFrame.from_ndarray(out, format="bgr24")
+
+
+def obj_count_panel(shown):
+    """Class-wise count bars + chips."""
+    counts = {}
+    colors = {}
+    for name, _, col in shown:
+        counts[name] = counts.get(name, 0) + 1
+        colors[name] = col
+    if not counts:
+        return
+    top = max(counts.values())
+    rows = "".join(
+        H(f"""
+        <div class="bar-row">
+            <span class="bar-name">{html.escape(n)}</span>
+            <div class="bar"><div class="bar-fill" style="width:{c / top * 100:.0f}%;
+                background:{obj_bgr_to_hex(colors[n])}"></div></div>
+            <span class="bar-pct">×{c}</span>
+        </div>
+        """)
+        for n, c in sorted(counts.items(), key=lambda kv: -kv[1])[:10]
+    )
+    st.markdown(
+        f"<div class='panel'><div class='panel-title'><span class='dot'></span>OBJECTS DETECTED</div>{rows}</div>",
+        unsafe_allow_html=True,
+    )
+
+
+@st.fragment(run_every=1)
+def obj_live_stats(ctx):
+    """Har second live numbers (sirf ye hissa dobara chalta hai)."""
+    proc = ctx.video_processor if ctx.state.playing else None
+    if proc is None:
+        st.caption("Press **START** above and allow camera access. Detection runs on every frame.")
+        return
+    with proc.lock:
+        found, counts = proc.found, dict(proc.counts)
+    m1, m2 = st.columns(2)
+    m1.metric("Objects in frame", found)
+    m2.metric("Speed", f"{proc.fps:.1f} FPS")
+    if counts:
+        st.markdown(chips(f"{n} ×{c}" for n, c in sorted(counts.items(), key=lambda kv: -kv[1])),
+                    unsafe_allow_html=True)
+
+
+OBJ_MODES = ["📷 Take photo", "📁 Upload image", "🎥 Live webcam"]
+
+
+def render_objects(p: dict):
+    page_hero(p)
+
+    f = p["files"]
+    if not require_files([f["weights"], f["cfg"]]):
+        return
+
+    # Git LFS ke bina upload karne par .weights ki jagah chhoti text file aa jaati hai
+    if Path(f["weights"]).stat().st_size < 1_000_000:
+        st.error("The weights file is very small, so it is probably not the real model "
+                 "(a Git LFS pointer, or a failed upload). Re-upload the full .weights file.")
+        return
+
+    try:
+        import cv2  # noqa: F401
+    except ImportError:
+        st.error("The `opencv-python` package is not installed. Run this in your terminal:")
+        st.code("pip install opencv-python-headless", language="bash")
+        return
+
+    if int(cv2.__version__.split(".")[0]) >= 5:
+        # OpenCV 5 ne Darknet (YOLOv4 .cfg/.weights) importer hata diya hai
+        st.error(f"OpenCV {cv2.__version__} cannot load YOLOv4 .weights files (Darknet support was "
+                 "removed in OpenCV 5). In the same Python environment that runs Streamlit, run:")
+        st.code('pip uninstall -y opencv-python opencv-python-headless opencv-contrib-python\n'
+                'pip install "opencv-python-headless<5"', language="bash")
+        return
+
+    names = load_class_names(f["names"])
+    st.info(p["disclaimer"])
+
+    left, right = st.columns([3, 2], gap="large")
+
+    with left:
+        st.markdown("##### ⚙️ Detection settings")
+        c1, c2, c3 = st.columns(3)
+        conf = c1.slider("Confidence", 0.10, 0.95, 0.50, 0.05, key="obj_conf",
+                         help="Higher = fewer but surer detections.")
+        nms = c2.slider("Overlap (NMS)", 0.10, 0.95, 0.50, 0.05, key="obj_nms",
+                        help="Lower = removes duplicate boxes more strongly.")
+        size = c3.select_slider("Input size", OBJ_INPUT_SIZES, value=416, key="obj_size",
+                                help="Bigger = more accurate but slower.")
+        allow = st.multiselect("Only show these objects (empty = show all)", names, key="obj_allow")
+
+        mode = st.radio("Input", OBJ_MODES, horizontal=True, key="obj_mode",
+                        label_visibility="collapsed")
+
+        data = None
+        analyze = False
+        if mode == OBJ_MODES[0]:
+            shot = st.camera_input("Take a photo", key="obj_cam", label_visibility="collapsed")
+            data = shot.getvalue() if shot is not None else None
+            analyze = st.button(p["button_text"], key="obj_go_cam")
+        elif mode == OBJ_MODES[1]:
+            up = st.file_uploader("Choose a JPG or PNG image", type=["jpg", "jpeg", "png"],
+                                  key="obj_file", label_visibility="collapsed")
+            data = up.getvalue() if up is not None else None
+            analyze = st.button(p["button_text"], key="obj_go_up")
+
+    with right:
+        how_panel(p)
+
+    # ---------------- Live webcam ----------------
+    if mode == OBJ_MODES[2]:
+        st.markdown("---")
+        if not WEBRTC_OK:
+            st.error("Live webcam needs two extra packages. Run this and restart Streamlit:")
+            st.code("pip install streamlit-webrtc av", language="bash")
+        else:
+            ctx = webrtc_streamer(
+                key="obj_live",
+                mode=WebRtcMode.SENDRECV,
+                video_processor_factory=lambda: YoloProcessor(str(f["weights"]), str(f["cfg"]), names, size),
+                rtc_configuration=ATT_RTC,
+                media_stream_constraints={"video": {"width": {"ideal": 640}}, "audio": False},
+                async_processing=True,
+            )
+            if ctx.video_processor:
+                with ctx.video_processor.lock:   # sliders live apply hote hain
+                    ctx.video_processor.conf = conf
+                    ctx.video_processor.nms = nms
+                    ctx.video_processor.allow = set(allow)
+                    ctx.video_processor.size = size
+            obj_live_stats(ctx)
+            st.caption("Tip: the full YOLOv4 is heavy on a CPU. For smoother video use the "
+                       "yolov4-tiny files, or a smaller input size.")
+        footer()
+        return
+
+    # ---------------- Photo / upload ----------------
+    if analyze:
+        if not data:
+            st.warning("⚠️ Please take a photo or upload an image first.")
+            return
+        try:
+            with st.spinner("Detecting objects..."):
+                img = decode_image(data)
+                net = load_yolo(str(f["weights"]), str(f["cfg"]), size)
+                t0 = time.perf_counter()
+                with OBJ_LOCK:
+                    dets = yolo_detect(net, img, conf, nms)
+                ms = (time.perf_counter() - t0) * 1000
+                annotated, shown = draw_detections(img, dets, names, set(allow))
+        except Exception as e:
+            st.error(f"An error occurred during processing: {e}  "
+                     "(Check that the .cfg and .weights files belong to the same model.)")
+            return
+
+        st.markdown("---")
+        st.image(cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB), use_container_width=True)
+
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Objects found", len(shown))
+        m2.metric("Different types", len({n for n, _, _ in shown}))
+        m3.metric("Inference time", f"{ms:.0f} ms")
+
+        if not shown:
+            st.warning("😕 No objects found. Try a lower confidence value or a clearer photo.")
+        else:
+            obj_count_panel(shown)
+            with st.expander("📋 All detections"):
+                st.dataframe(
+                    [{"object": n, "confidence": f"{sc:.1%}"} for n, sc, _ in
+                     sorted(shown, key=lambda t: -t[1])],
+                    use_container_width=True,
+                )
+            ok, buf = cv2.imencode(".png", annotated)
+            if ok:
+                st.download_button("⬇️ Download result image", buf.tobytes(),
+                                   file_name="detected.png", mime="image/png")
 
     footer()
 
@@ -2014,6 +2335,38 @@ PROJECTS = {
             "Train Model: one click trains a Logistic Regression on all photos.",
             "Recognize: take a photo and see the name with a confidence score.",
             "Faces are marked with a box and name on the photo.",
+        ],
+    },
+    # ----------------------------------------------------------------
+    "objects": {
+        "key": "objects",
+        "icon": "🎯",
+        "title": "Object Detection (YOLOv4)",
+        "tagline": "Point the camera or upload a photo and watch YOLO find everything in it.",
+        "desc": "Real-time object detection with YOLOv4 and OpenCV DNN. Detects 80 everyday object "
+                "types (person, car, phone, dog...) in a photo or live webcam, with adjustable "
+                "confidence, class filter and per-object counts.",
+        "colors": ("#f43f5e", "#f59e0b"),
+        "tags": ["Computer Vision", "YOLOv4", "OpenCV DNN", "Real-time"],
+        "render": render_objects,
+        "files": {
+            "weights": pick(MODELS_DIR / "object_detection" / "yolov4.weights",
+                            MODELS_DIR / "object_detection" / "yolov4-tiny.weights"),
+            "cfg": pick(MODELS_DIR / "object_detection" / "yolov4.cfg",
+                        MODELS_DIR / "object_detection" / "yolov4-tiny.cfg"),
+            "names": pick(MODELS_DIR / "object_detection" / "objects_list.txt",
+                          MODELS_DIR / "object_detection" / "coco.names"),
+        },
+        "required": ["weights", "cfg"],   # names na ho to 80 COCO naam built-in hain
+        "disclaimer": "This is a learning demo. YOLO can miss small or blurry objects and sometimes "
+                      "mislabels things. Your photo is used only for this prediction and is not stored. "
+                      "The live webcam needs an HTTPS address when deployed.",
+        "button_text": "🔍 Detect Objects",
+        "how": [
+            "Take a photo, upload an image or start the live webcam.",
+            "The image is resized to 416x416 and scaled to 0-1 for YOLOv4.",
+            "The network predicts boxes, and overlapping ones are merged (NMS).",
+            "You see coloured boxes, labels and a count of every object type.",
         ],
     },
     # ----------------------------------------------------------------
