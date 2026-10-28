@@ -10,10 +10,11 @@ requests
 librosa
 soundfile
 
-# Face Gender Detection + Face Recognition Attendance
-# (<5 because OpenCV 5 removed the Haar cascade face detector)
+# Face Gender, Face Attendance and Object Detection (YOLOv4)
+# Use ONLY this OpenCV package (no plain opencv-python).
+# <5 is required: OpenCV 5 removed the Haar face detector and the Darknet/YOLO loader.
 opencv-python-headless<5
 
-# Attendance: automatic live-camera capture
+# Live camera: Attendance auto-capture and YOLO live webcam
 streamlit-webrtc
 av
